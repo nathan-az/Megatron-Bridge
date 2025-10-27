@@ -485,6 +485,15 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
         if self.tp_size == 1:
             return splits[0].to(device=device) if splits else None
 
+        if device.type == "cpu":
+            if torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                raise RuntimeError(
+                    "Tensor-parallel scatter requires CUDA tensors with NCCL backend. "
+                    "Run with tp_size=1 or move tensors to CUDA."
+                )
+
         output = torch.empty(output_shape, dtype=dtype, device=device)
         global_src = torch.distributed.get_global_rank(group=self.tp_group, group_rank=src_rank)
 
