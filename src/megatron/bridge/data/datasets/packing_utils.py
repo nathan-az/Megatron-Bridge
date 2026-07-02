@@ -296,7 +296,12 @@ def fill_packing_strategy(
     for i in range(len(input_ids)):
         item_dict = {
             "input_ids": input_ids[i],
-            "loss_mask": loss_mask[i],
+            # Coerce to plain int: the rolled mask above appends a Python ``False``
+            # (``x[1:] + [False]``), so an integer source loss_mask (e.g. from a chat
+            # template's ``return_assistant_tokens_mask``) becomes a mixed int/bool
+            # list that pyarrow rejects ("Expected integer, got bool") when writing
+            # the packed parquet (loss_mask column is list<int8>).
+            "loss_mask": [int(v) for v in loss_mask[i]],
             "seq_start_id": seq_start_id[i],
         }
         output_data.append(item_dict)

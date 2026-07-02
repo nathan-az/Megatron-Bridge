@@ -150,6 +150,18 @@ class Gemma4DenseProvider(GPTModelProvider):
     moe_router_topk: Optional[int] = None
     moe_ffn_hidden_size: Optional[int] = None
 
+    # Opt-in: swap the local (CP=1) core attention for the context-parallel,
+    # head-dim-flexible Gemma4DenseCPAttention (see gemma4_cp_attention.py).
+    # Default False keeps the existing behavior unchanged.
+    hybrid_cp_attention: bool = False
+
+    # Opt-in: torch.compile the per-layer MLP region (_forward_mlp: pre-MLP norm +
+    # gate/up/geglu/down + post-MLP norm + residual). Inductor fuses the
+    # bandwidth-bound norm/activation/residual chains (graph-breaks at the mcore
+    # linears' custom autograd are fine). The local (non-TE) spec leaves these
+    # unfused — profiling (PLAN §27-§28) showed they rival GEMM. Default False.
+    torch_compile_mlp: bool = False
+
     def finalize(self) -> None:
         super().finalize()
         self._gemma4_dense_finalized = True

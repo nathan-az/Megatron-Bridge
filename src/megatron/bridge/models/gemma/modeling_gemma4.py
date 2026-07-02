@@ -526,6 +526,13 @@ class Gemma4DenseTransformerLayer(TransformerLayer):
             self.post_feedforward_layernorm_2 = None
             self.pre_feedforward_layernorm_2 = None
 
+        # Opt-in: torch.compile the MLP region so Inductor fuses the bandwidth-bound
+        # pre-/post-MLP RMSNorm + geglu + residual chains (PLAN §28). It graph-breaks
+        # at the mcore linears' custom autograd (kept as-is) but fuses the pointwise
+        # work between them. Shapes are static under pad_to_max_length (no recompiles).
+        if getattr(config, "torch_compile_mlp", False):
+            self._forward_mlp = torch.compile(self._forward_mlp)
+
     def forward(self, *args, **kwargs):
         per_layer_input = kwargs.pop("per_layer_input", None)
 
@@ -685,8 +692,23 @@ def wire_gemma4_kv_sharing(model: nn.Module) -> None:
 
 
 def get_gemma4_layer_spec(config: Optional[TransformerConfig] = None) -> ModuleSpec:
-    """Return a ModuleSpec for a Gemma-4 Dense transformer layer (local/non-TE)."""
+    """Return a ModuleSpec for a Gemma-4 Dense transformer layer (local/non-TE).
+
+    Default core attention is mcore's local ``DotProductAttention`` (CP=1, no
+    packing). If ``config.hybrid_cp_attention`` is set, the core attention is
+    swapped for :class:`Gemma4DenseCPAttention`, which is context-parallel and
+    head-dim-flexible (handles the 512 global layers). This is fully opt-in — the
+    default path is unchanged.
+    """
     backend = LocalSpecProvider()
+
+    if config is not None and getattr(config, "hybrid_cp_attention", False):
+        # Lazy import avoids a circular dependency (that module imports from here).
+        from megatron.bridge.models.gemma.gemma4_cp_attention import Gemma4DenseCPAttention
+
+        core_attention = Gemma4DenseCPAttention
+    else:
+        core_attention = backend.core_attention()
 
     submodules = Gemma4DenseTransformerLayerSubmodules(
         input_layernorm=RMSNorm,
@@ -695,7 +717,7 @@ def get_gemma4_layer_spec(config: Optional[TransformerConfig] = None) -> ModuleS
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=backend.column_parallel_linear(),
-                core_attention=backend.core_attention(),
+                core_attention=core_attention,
                 linear_proj=backend.row_parallel_linear(),
                 q_layernorm=RMSNorm,
                 k_layernorm=RMSNorm,
@@ -993,8 +1015,32 @@ def _gemma4_checkpointed_forward(
                     *args,
                 )
             else:
-                hidden_states, context = tensor_parallel.checkpoint(
-                    cf, self.config.distribute_saved_activations, *args
+                # mcore's ``tensor_parallel.checkpoint`` saves *every* positional
+                # arg via ``save_for_backward``, which rejects Gemma-4's dual-RoPE
+                # ``rotary_pos_emb`` (a (sliding, global) tuple) —
+                # "save_for_backward can only save variables, but argument 4 is of
+                # type tuple". Route through torch's non-reentrant checkpoint
+                # instead: close over the non-differentiable / tuple args
+                # (rotary tuple, masks, packed_seq_params via ``cf``) and pass only
+                # the grad-bearing tensors (hidden_states, context, per_layer_inputs)
+                # as checkpoint inputs. Safe here because the dense Gemma-4 layers
+                # have no stochastic ops (attention_dropout == hidden_dropout == 0),
+                # so recompute needs no RNG replay; ``preserve_rng_state=False``
+                # also avoids perturbing mcore's model-parallel RNG tracker.
+                from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+
+                _hs, _ctx, _ple = hidden_states, context, per_layer_inputs
+
+                def _tuple_safe_forward(hs, ctx, ple):
+                    return cf(hs, attention_mask, ctx, context_mask, rotary_pos_emb, padding_mask, ple)
+
+                hidden_states, context = _torch_checkpoint(
+                    _tuple_safe_forward,
+                    _hs,
+                    _ctx,
+                    _ple,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
                 )
         else:
             hidden_states, context = cf(*args)
@@ -1078,9 +1124,17 @@ def _patch_ple_block_threading(decoder: "torch.nn.Module") -> None:
         orig_checkpointed_forward = transformer_block_module.checkpointed_forward
         self._gemma4_current_per_layer_inputs = per_layer_inputs
 
+        # Full-layer recompute must use the Gemma4-aware checkpointed forward even
+        # when there is no PLE (the 31B dense model has per_layer_embed_dim=0): the
+        # stock mcore path passes the dual-RoPE tuple through save_for_backward and
+        # crashes. Install our tuple-safe variant whenever PLE is present OR full
+        # recompute is on.
+        full_recompute = getattr(self.config, "recompute_granularity", None) == "full"
+
         def _checkpointed_forward_with_ple(block, *cf_args, **cf_kwargs):
             block_per_layer_inputs = getattr(block, "_gemma4_current_per_layer_inputs", None)
-            if block is not self or block_per_layer_inputs is None:
+            use_gemma4 = block is self and (block_per_layer_inputs is not None or full_recompute)
+            if not use_gemma4:
                 return orig_checkpointed_forward(block, *cf_args, **cf_kwargs)
             return _gemma4_checkpointed_forward(
                 block,
@@ -1089,7 +1143,7 @@ def _patch_ple_block_threading(decoder: "torch.nn.Module") -> None:
                 per_layer_inputs=block_per_layer_inputs,
             )
 
-        if per_layer_inputs is not None:
+        if per_layer_inputs is not None or full_recompute:
             transformer_block_module.checkpointed_forward = _checkpointed_forward_with_ple
         try:
             return orig_decoder_forward(*args, **kwargs)
