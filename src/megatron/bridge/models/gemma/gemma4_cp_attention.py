@@ -37,6 +37,7 @@ The standalone algorithm + parity vs no-CP is validated in
 ``rovo-train-bridge/cp/test_global_cp_parity.py``.
 """
 
+import copy
 import os
 from typing import Optional
 
@@ -52,6 +53,12 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.bridge.models.gemma.ffpa_kernel import ffpa_dense_available, ffpa_dense_bwd, ffpa_dense_fwd
 from megatron.bridge.models.gemma.modeling_gemma4 import _is_gemma4_sliding_layer
+
+
+try:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention as _TEDotProductAttention
+except Exception:  # pragma: no cover - TE always present in our container, but keep import optional
+    _TEDotProductAttention = None
 
 
 _FLEX_ATTENTION = None
@@ -317,6 +324,8 @@ class Gemma4DenseCPAttention(torch.nn.Module):
         attention_type: str = "self",
         attention_dropout: Optional[float] = None,
         softmax_scale: Optional[float] = None,
+        cp_comm_type: Optional[str] = None,
+        pg_collection=None,
         **kwargs,
     ):
         super().__init__()
@@ -334,6 +343,32 @@ class Gemma4DenseCPAttention(torch.nn.Module):
             ws = getattr(config, "window_size", None)
             if ws is not None:
                 self.window_left = ws[0] if isinstance(ws, (tuple, list)) else int(ws)
+
+        # Sliding layers: delegate to mcore TEDotProductAttention, which does CP itself. TE
+        # supports sliding-window CP only via cp_comm_type in {"a2a","all_gather"} (NOT the
+        # "p2p" ring — asserted in TE). We default to "a2a" (Ulysses): it shards KV by *heads*
+        # so each rank's KV working set is full_KV/cp — the memory win (equivalent to a ring's
+        # S/cp, partitioned by head) — while supporting the window (see _build_te_sliding).
+        # This is the dominant memory lever (PLAN §32.0/§33): head_dim 256 + window are TE-
+        # supported (global hd512 is not → it keeps the FFPA all-gather path). TE gets the
+        # same config.window_size (left,0) and config.softmax_scale the flex/ffpa path used →
+        # identical mask + scale (parity by construction, validated). Rollback / parity
+        # baseline: GEMMA4_SLIDING_CP=allgather restores the flex all-gather sliding path.
+        self._te_sliding = None
+        if (
+            self.is_sliding
+            and self.window_left is not None
+            and os.environ.get("GEMMA4_SLIDING_CP", "te") != "allgather"
+        ):
+            if _TEDotProductAttention is None:
+                raise RuntimeError(
+                    "GEMMA4_SLIDING_CP requests the TE sliding path but TEDotProductAttention "
+                    "is unavailable; set GEMMA4_SLIDING_CP=allgather to use the flex all-gather path."
+                )
+            self._te_sliding = self._build_te_sliding(
+                config, layer_number, attn_mask_type, attention_type, attention_dropout,
+                softmax_scale, cp_comm_type, pg_collection,
+            )
         # Cache of FlexAttention BlockMasks keyed by (sq, skv) for the *non-packed*
         # path: the causal(+window) predicate over this rank's static global
         # positions is identical every step and across every layer of this type,
@@ -345,6 +380,51 @@ class Gemma4DenseCPAttention(torch.nn.Module):
         # per-rank query runs and the KV global-sort permutation are static per
         # sequence length (non-packed), identical every step and layer-of-type.
         self._ffpa_cache: dict = {}
+
+    def _build_te_sliding(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: Optional[float],
+        softmax_scale: Optional[float],
+        cp_comm_type: Optional[str],
+        pg_collection,
+    ):
+        """Construct a windowed :class:`TEDotProductAttention` for this sliding layer.
+
+        The window is *forced* on: mcore's ``is_layer_window_attention`` misreads Gemma's
+        string-list ``window_attn_skip_freq`` (any non-empty string ⇒ True), so we set it to
+        ``None`` on a deep copy (⇒ True whenever ``window_size`` is set) and pin
+        ``window_size=(window_left, 0)`` — the exact left window the flex/ffpa path used, so
+        the mask is identical. ``softmax_scale`` is pinned to the module's resolved scale
+        (=config's, 1.0 for Gemma-4) so the score scaling matches too. TE handles CP itself
+        (p2p ring by default → S/cp working set) and packed THD via ``packed_seq_params``.
+        """
+        te_config = copy.deepcopy(config)
+        te_config.window_attn_skip_freq = None
+        te_config.window_size = (int(self.window_left), 0)
+        # TE CP supports sliding window ONLY with cp_comm_type in {"a2a","all_gather"} (NOT
+        # "p2p" ring — asserted in TE context_parallel.py). Default to "a2a" (Ulysses):
+        # it shards KV by *heads* so each rank's KV working set is full_KV/cp — the memory
+        # win (equivalent to the ring's S/cp, partitioned by head instead of sequence) —
+        # and it supports the window. "all_gather" is the fallback (full-S KV per rank =
+        # no memory win, just a faster fused kernel). Requires heads % cp == 0 for a2a
+        # (Gemma-4: 32 Q / 16 KV heads → ok through cp=16). Env-overridable.
+        sliding_cp_comm = os.environ.get("GEMMA4_SLIDING_CP_COMM", "a2a")
+        kwargs = dict(
+            config=te_config,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type=attention_type,
+            attention_dropout=attention_dropout,
+            softmax_scale=self.softmax_scale,
+            cp_comm_type=sliding_cp_comm,
+        )
+        if pg_collection is not None:
+            kwargs["pg_collection"] = pg_collection
+        return _TEDotProductAttention(**kwargs)
 
     def _build_mask(self, q_pos: Tensor, kv_pos: Tensor) -> Tensor:
         """[sq, sk] bool mask (True = attend): causal + optional sliding window.
@@ -600,6 +680,22 @@ class Gemma4DenseCPAttention(torch.nn.Module):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         assert attention_bias is None, "attention_bias not supported."
+
+        # Sliding layers delegate to TE (its own p2p-ring CP + fused windowed kernel). TE
+        # consumes the raw sbhd/thd inputs and does the CP KV exchange internally, so we
+        # short-circuit before the all-gather/permute path below. Global (hd512) layers and
+        # the GEMMA4_SLIDING_CP=allgather rollback fall through to the flex/ffpa all-gather.
+        if self._te_sliding is not None:
+            return self._te_sliding(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type if attn_mask_type is not None else self.attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+
         kernel = os.environ.get("GEMMA4_CP_KERNEL", "flex")
 
         cp_group = parallel_state.get_context_parallel_group()
